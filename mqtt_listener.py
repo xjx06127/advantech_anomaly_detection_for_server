@@ -142,33 +142,43 @@ def on_message(client, userdata, msg):
     print(f"\n[{msg.topic}] 메시지 수신:")
     
     try:
-        # 1. 메시지(payload)를 문자열로 디코딩
+        # 1. 메시지(payload)를 문자열로 디코딩 및 JSON 파싱
         payload_str = msg.payload.decode('utf-8')
-        
-        # 2. ESP32가 JSON 형식으로 보냈다고 가정하고 파싱
-        # (예: {"body_temp": 35.5, "hr": 80, "env_temp": 25.0, "humidity": 50.0})
         data = json.loads(payload_str)
-        print(f"  수신 데이터 (JSON): {data}")
-
-        # 3. 모델 입력 순서에 맞게 데이터 추출
-        # (순서 중요: body_temp, heart_rate, env_temp, env_humidity)
-        input_data = [[
-            data['body_temp'],
-            data['hr'],
-            data['env_temp'],
-            data['humidity']
-        ]]
-
-        # 4. 하이브리드 모델로 예측 실행
-        prediction_result = predict_hybrid(input_data, scaler, model)
         
-        # 5. 예측 결과 출력
-        print(f"  >>> 예측 결과: {prediction_result[0]}")
+        # 2. 데이터 추출
+        mcu_id = data.get('mcu_id', 'UNKNOWN_MCU')
+        body_temp = data.get('body_temp', 'N/A')
+        hr = data.get('hr', 'N/A')
+        env_temp = data.get('env_temp', 'N/A')
+        humidity = data.get('humidity', 'N/A')
+        beacons = data.get('beacons', [])
+        beacon_count = len(beacons)
+
+        # 3. "한 줄 요약 로그" 출력
+        print(f"[MCU: {mcu_id}] Temp: {body_temp}°C, HR: {hr}, Env: {env_temp}°C/{humidity}%, Beacons: {beacon_count}")
+
+        # 4. "상세 비콘 목록" 출력 (들여쓰기 적용)
+        if beacon_count > 0:
+            print("  └ [비콘 상세]: ", end="")
+            beacon_details = []
+            for beacon in beacons:
+                beacon_details.append(
+                    f"Major/Minor: {beacon.get('major', 'N/A')}/{beacon.get('minor', 'N/A')} (RSSI: {beacon.get('rssi', 'N/A')} dBm)"
+                )
+            # 쉼표로 연결하여 한 줄 또는 여러 줄로 출력
+            print(", ".join(beacon_details))
+
+        input_data = [[body_temp, hr, env_temp, humidity]]
+
+        # 하이브리드 모델로 예측 실행
+        prediction_result = predict_hybrid(input_data, scaler, model)
+            
+        # 7. 예측 결과 출력 (들여쓰기 추가)
+        print(f"  └ [예측 결과]: >>> {prediction_result[0]}")
 
     except json.JSONDecodeError:
         print(f"  [오류] 수신된 데이터가 유효한 JSON 형식이 아닙니다: {payload_str}")
-    except KeyError as e:
-        print(f"  [오류] 수신된 JSON에 필요한 키({e})가 없습니다.")
     except Exception as e:
         print(f"  [오류] 데이터 처리 중 예외 발생: {e}")
 

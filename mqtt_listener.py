@@ -42,9 +42,9 @@ def get_wind_chill(env_temp, env_humidity):
     temp_data = WIND_CHILL_DATA[rounded_temp]
     rounded_humidity = int(round(env_humidity / 5.0) * 5)
     if rounded_humidity < 25:
-        return None;
+        return None
     if rounded_humidity > 100:
-        return None;
+        return None
     if rounded_humidity in temp_data:
         return temp_data[rounded_humidity]
     else:
@@ -131,6 +131,7 @@ def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print(f"MQTT 브로커에 연결되었습니다 (Host: {MQTT_BROKER_HOST})")
         # 연결 성공 시, ESP32가 보낼 토픽을 구독(subscribe)
+        # f라는 키워드를 통해 fstring사용. 즉 중괄호 부분을 코드로 인식
         client.subscribe(MQTT_TOPIC)
         print(f"'{MQTT_TOPIC}' 토픽을 구독합니다.")
     else:
@@ -178,6 +179,7 @@ client.on_message = on_message  # 메시지 수신 콜백 함수 지정
 
 try:
     client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, 60)
+    # 60초 동안 메세지 안오면 연결 확인 상태 메세지 보냄
     # loop_forever(): 스크립트가 종료되지 않고 계속 실행되며 MQTT 메시지를 기다림
     print(f"'{MQTT_BROKER_HOST}'에 연결을 시도합니다...")
     client.loop_forever()

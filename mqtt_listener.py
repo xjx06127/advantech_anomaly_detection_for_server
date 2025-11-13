@@ -156,7 +156,7 @@ def on_message(client, userdata, msg):
         beacon_count = len(beacons)
 
         # 3. "한 줄 요약 로그" 출력
-        print(f"[MCU: {mcu_id}] Temp: {body_temp}°C, HR: {hr}, Env: {env_temp}°C/{humidity}%, Beacons: {beacon_count}")
+        print(f"[MCU: {mcu_id}] Temp: {body_temp}°C, HR: {hr}, Env_Temp: {env_temp}°C, Humidity: {humidity}%, Beacons: {beacon_count}")
 
         # 4. "상세 비콘 목록" 출력 (들여쓰기 적용)
         if beacon_count > 0:

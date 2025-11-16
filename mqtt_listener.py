@@ -1,14 +1,15 @@
-# mqtt_listener.py
+# mqtt_listener.py (수정됨: 서버 메인 로직)
 
 import paho.mqtt.client as mqtt
 import json
 import joblib
 import pandas as pd
 import numpy as np
+import time # 환경 데이터 타임스탬프용
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import IsolationForest
 
-print("--- 하이브리드 위험 예측 리스너 (MQTT) ---")
+print("--- 하이브리드 위험 예측 서버 (MQTT) ---")
 print("모델과 스케일러를 로드합니다...")
 
 # =============================================================================
@@ -39,16 +40,17 @@ def get_wind_chill(env_temp, env_humidity):
     rounded_temp = int(round(env_temp))
     if rounded_temp < 25 or rounded_temp > 40:
         return None
-    temp_data = WIND_CHILL_DATA[rounded_temp]
+    temp_data = WIND_CHILL_DATA.get(rounded_temp) # .get()으로 변경하여 Key 에러 방지
+    if temp_data is None:
+        return None
+        
     rounded_humidity = int(round(env_humidity / 5.0) * 5)
     if rounded_humidity < 25:
-        return None
+        return None # 25 미만 데이터는 표에 없음
     if rounded_humidity > 100:
-        return None
-    if rounded_humidity in temp_data:
-        return temp_data[rounded_humidity]
-    else:
-        return None
+        rounded_humidity = 100 # 100 초과 시 100으로 간주
+        
+    return temp_data.get(rounded_humidity) # .get()으로 변경
 
 def classify_risk_rules(body_temp, heart_rate, env_temp, env_humidity):
     wind_chill = get_wind_chill(env_temp, env_humidity)
@@ -76,13 +78,18 @@ def classify_risk_rules(body_temp, heart_rate, env_temp, env_humidity):
         return "원인 불명 이상치"
 
 # =============================================================================
-# 파트 2: 하이브리드 예측 함수 - (기존 코드 복사)
+# 파트 2: 하이브리드 예측 함수
 # =============================================================================
-# (예측에 필요하므로 기존 코드를 그대로 가져옵니다)
-
 def predict_hybrid(data_list, fitted_scaler, fitted_model):
     results = []
     df_data = pd.DataFrame(data_list, columns=['body_temp', 'heart_rate', 'env_temp', 'env_humidity'])
+    
+    # 입력 데이터 유효성 검사 (모델 입력 전)
+    for col in df_data.columns:
+        if df_data[col].isnull().any() or not np.all(np.isfinite(df_data[col])):
+             print(f"[예측 오류] 입력 데이터에 Null 또는 비유한 값이 있습니다: {data_list}")
+             return [f"데이터 오류 ({col})"]
+
     data_scaled = fitted_scaler.transform(df_data)
     anomaly_predictions = fitted_model.predict(data_scaled)
 
@@ -109,78 +116,203 @@ except FileNotFoundError:
     exit()
 
 # =============================================================================
-# 파트 4: MQTT 설정 및 실행
+# 파트 4: 서버 상태 관리
 # =============================================================================
 
-# --- MQTT 설정 (여기만 수정하세요) ---
+# 비콘 Key를 환경 이름으로 매핑하는 딕셔너리
+# Key: "Major-Minor"
+# Value: "환경 이름"
+BEACON_TO_ENV_MAP = {
+    "40011-55612": "환경 1 (고온)", # 사용자가 요청한 비콘
+    "9999-1": "환경 2 (저온)",    # 더미값 1
+    "9999-2": "환경 3 (일반)",    # 더미값 2
+}
 
-# 1. MQTT 브로커 주소
-# 가장 쉬운 방법: public MQTT 브로커 사용 (예: 'broker.hivemq.com')
-# 또는 로컬에 Mosquitto 등을 설치했다면 'localhost' 또는 '127.0.0.1'
+# 환경 데이터를 실시간 저장할 딕셔너리 (Key: "환경 이름", Value: {온습도, 타임스탬프})
+environment_state = {} 
+# 예: {'환경 1 (고온)': {'env_temp': 40.5, 'env_humi': 15.2, 'last_updated': 1678886400.0}}
+
+# 환경 데이터가 이 시간(초)보다 오래되면 '오래된 데이터'로 간주함
+ENV_DATA_TIMEOUT_SECONDS = 1000.0 # 30초 (30초 이상 갱신이 안되면 해당 데이터 사용 안함)
+
+
+# =============================================================================
+# 파트 5: MQTT 메시지 핸들러
+# =============================================================================
+
+def handle_env_message(data):
+    """ 'env/data' 토픽의 메시지를 처리하여 environment_state를 갱신합니다. """
+    try:
+        major = data.get('beacon_major')
+        minor = data.get('beacon_minor')
+        if major is None or minor is None:
+            print(f" [환경 데이터 오류] 비콘 ID(Major/Minor)가 없습니다: {data}")
+            return
+
+        # Key를 "Major-Minor" 형태의 문자열로 생성
+        beacon_key = f"{major}-{minor}" 
+        
+        # 비콘 Key를 환경 이름으로 변환
+        env_name = BEACON_TO_ENV_MAP.get(beacon_key)
+        if env_name is None:
+            print(f" [환경 데이터 경고] 매핑되지 않은 비콘 ID입니다: {beacon_key}")
+            return
+
+        temp = data.get('temperature')
+        humi = data.get('humidity')
+
+        if temp is None or humi is None:
+            print(f" [환경 데이터 오류] 온습도 값이 없습니다: {data}")
+            return
+            
+        # 딕셔너리 업데이트 (Key: env_name)
+        environment_state[env_name] = {
+            'env_temp': temp,
+            'env_humi': humi,
+            'last_updated': time.time()
+        }
+        print()
+        print(f"[환경 상태 갱신] {env_name} (비콘 {beacon_key}) -> Temp: {temp}°C, Humi: {humi}%")
+        
+    except Exception as e:
+        print(f" [오류] handle_env_message 처리 중 예외 발생: {e}")
+
+def handle_vest_message(client, data):
+    """ 'vest/data' 토픽의 메시지를 처리하여 예측 및 경보를 수행합니다. """
+    try:
+        # 1. 조끼 데이터 추출
+        mcu_id = data.get('mcu_id')
+        body_temp = data.get('body_temp')
+        hr = data.get('hr')
+        is_fell = data.get('is_fell')
+        scanned_beacons = data.get('beacons', [])
+
+        if mcu_id is None:
+            print(f" [조끼 데이터 오류] mcu_id가 없습니다: {data}")
+            return
+
+        print(f"\n[조끼 데이터 수신: {mcu_id}] Temp: {body_temp}°C, HR: {hr}, Fell: {is_fell}, Beacons: {len(scanned_beacons)}개")
+
+        # 2. 위치(환경) 매핑
+        if not scanned_beacons:
+            print(f" └ [오류] {mcu_id}가 스캔한 비콘이 없습니다. 위치를 매핑할 수 없습니다.")
+            return
+
+        # RSSI가 가장 높은 비콘 찾기 (신호가 가장 강한 비콘 = 현재 위치)
+        # RSSI는 음수이므로, max() 함수가 가장 0에 가까운 값을 찾음
+        strongest_beacon = max(scanned_beacons, key=lambda b: b['rssi'])
+        major = strongest_beacon.get('major')
+        minor = strongest_beacon.get('minor')
+        beacon_key = f"{major}-{minor}"
+        
+        # 비콘 Key를 환경 이름으로 변환
+        env_name = BEACON_TO_ENV_MAP.get(beacon_key)
+        
+        print(f" └ [위치 매핑] 가장 강한 비콘: {beacon_key} -> {env_name if env_name else '알 수 없는 환경'}")
+
+        if env_name is None:
+            print(f" └ [오류] {mcu_id}가 스캔한 비콘({beacon_key})을 환경에 매핑할 수 없습니다.")
+            return
+
+        # 3. 환경 데이터 융합 (State에서 조회)
+        # env_name을 Key로 사용하여 조회
+        env_data = environment_state.get(env_name)
+        if env_data is None:
+            print(f" └ [오류] '{env_name}'({beacon_key})에 해당하는 환경 정보가 서버에 없습니다.")
+            print(f" └ (현재 서버 상태: {list(environment_state.keys())})")
+            return
+        
+        # 타임스탬프 검사 (오래된 데이터 방지)
+        current_time = time.time()
+        data_age = current_time - env_data.get('last_updated', 0)
+        
+        if data_age > ENV_DATA_TIMEOUT_SECONDS:
+            print(f" └ [오류] '{env_name}'의 환경 데이터가 너무 오래되었습니다! ({data_age:.0f}초 경과)")
+            print(f" └ (조끼 {mcu_id}에 대한 예측을 건너뜁니다.)")
+            return
+            
+        env_temp = env_data['env_temp']
+        env_humi = env_data['env_humi']
+        
+        # 4. 최종 예측 (IMU 우선)
+        final_prediction = ""
+        if is_fell == 1: # 또는 True
+            final_prediction = "낙상 의심 (IMU)"
+        else:
+            # 5. 하이브리드 모델 예측 (IMU 정상이면)
+            # 입력 데이터 유효성 검사 (HR=0, Temp=0 등은 모델 에러 유발 가능)
+            if body_temp is None or hr is None or env_temp is None or env_humi is None:
+                print(f" └ [오류] 예측에 필요한 데이터가 누락되었습니다 (Body/HR/Env).")
+                return
+                
+            input_data = [[body_temp, hr, env_temp, env_humi]]
+            prediction_result = predict_hybrid(input_data, scaler, model)
+            final_prediction = prediction_result[0]
+
+        print(f" └ [최종 예측 결과]: >>> {final_prediction} <<<")
+
+        # 6. 조치 수행 (경보 또는 정상 신호 전송)
+        alert_topic = f"vest/alert/{mcu_id}" # 조끼가 구독 중인 고유 토픽
+
+        if final_prediction != "정상 (Normal)":
+            # 6-1. 위험! 조끼에 "ALERT" 전송
+            client.publish(alert_topic, "ALERT")
+            print(f" └ [조치] {mcu_id} 조끼로 'ALERT' ({final_prediction}) 전송 완료.")
+        else:
+            # 6-2. 정상! 조끼에 "NORMAL" 전송
+            client.publish(alert_topic, "NORMAL")
+            print(f" └ [조치] {mcu_id} 조끼로 'NORMAL' 전송 완료.")
+        
+    except Exception as e:
+        print(f" [오류] handle_vest_message 처리 중 예외 발생: {e}")
+
+
+# =============================================================================
+# 파트 6: MQTT 설정 및 실행
+# =============================================================================
+
+# --- MQTT 설정 ---
 MQTT_BROKER_HOST = 'broker.hivemq.com'
 MQTT_BROKER_PORT = 1883
 
-# 2. ESP32가 발행(Publish)할 토픽 이름
-# ESP32 코드에 설정된 토픽과 정확히 일치해야 합니다.
-MQTT_TOPIC = "esp32/sensor_data"
-
+# [수정됨] 구독할 토픽 목록
+MQTT_SUB_TOPICS = [
+    ("vest/data", 0),  # 조끼 데이터
+    ("env/data", 0)    # 환경 데이터
+]
 # ------------------------------------
 
 # MQTT 클라이언트가 브로커에 연결되었을 때 호출될 함수
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print(f"MQTT 브로커에 연결되었습니다 (Host: {MQTT_BROKER_HOST})")
-        # 연결 성공 시, ESP32가 보낼 토픽을 구독(subscribe)
-        # f라는 키워드를 통해 fstring사용. 즉 중괄호 부분을 코드로 인식
-        client.subscribe(MQTT_TOPIC)
-        print(f"'{MQTT_TOPIC}' 토픽을 구독합니다.")
+        # 여러 토픽 구독
+        client.subscribe(MQTT_SUB_TOPICS)
+        print(f"'{MQTT_SUB_TOPICS[0][0]}' 및 '{MQTT_SUB_TOPICS[1][0]}' 토픽을 구독합니다.")
     else:
         print(f"MQTT 연결 실패 (Code: {rc})")
 
-# MQTT 메시지(데이터)를 수신했을 때 호출될 함수
+# MQTT 메시지(데이터)를 수신했을 때 호출될 함수 (로직 분기)
 def on_message(client, userdata, msg):
-    print(f"\n[{msg.topic}] 메시지 수신:")
+    # print(f"\n[{msg.topic}] 메시지 수신:") # 로그가 너무 많아질 수 있으므로, 각 핸들러에서 출력
     
     try:
         # 1. 메시지(payload)를 문자열로 디코딩 및 JSON 파싱
         payload_str = msg.payload.decode('utf-8')
         data = json.loads(payload_str)
         
-        # 2. 데이터 추출
-        mcu_id = data.get('mcu_id', 'UNKNOWN_MCU')
-        body_temp = data.get('body_temp', 'N/A')
-        hr = data.get('hr', 'N/A')
-        env_temp = data.get('env_temp', 'N/A')
-        humidity = data.get('humidity', 'N/A')
-        beacons = data.get('beacons', [])
-        beacon_count = len(beacons)
-
-        # 3. "한 줄 요약 로그" 출력
-        print(f"[MCU: {mcu_id}] Temp: {body_temp}°C, HR: {hr}, Env_Temp: {env_temp}°C, Humidity: {humidity}%, Beacons: {beacon_count}")
-
-        # 4. "상세 비콘 목록" 출력 (들여쓰기 적용)
-        if beacon_count > 0:
-            print("  └ [비콘 상세]: ", end="")
-            beacon_details = []
-            for beacon in beacons:
-                beacon_details.append(
-                    f"Major/Minor: {beacon.get('major', 'N/A')}/{beacon.get('minor', 'N/A')} (RSSI: {beacon.get('rssi', 'N/A')} dBm)"
-                )
-            # 쉼표로 연결하여 한 줄 또는 여러 줄로 출력
-            print(", ".join(beacon_details))
-
-        input_data = [[body_temp, hr, env_temp, humidity]]
-
-        # 하이브리드 모델로 예측 실행
-        prediction_result = predict_hybrid(input_data, scaler, model)
+        # 2. 토픽에 따라 핸들러 분기
+        if msg.topic == "env/data":
+            handle_env_message(data)
             
-        # 7. 예측 결과 출력 (들여쓰기 추가)
-        print(f"  └ [예측 결과]: >>> {prediction_result[0]}")
+        elif msg.topic == "vest/data":
+            # client 객체를 넘겨주어 publish(경보 전송)가 가능하도록 함
+            handle_vest_message(client, data)
 
     except json.JSONDecodeError:
-        print(f"  [오류] 수신된 데이터가 유효한 JSON 형식이 아닙니다: {payload_str}")
+        print(f" [오류] 수신된 데이터가 유효한 JSON 형식이 아닙니다: {payload_str}")
     except Exception as e:
-        print(f"  [오류] 데이터 처리 중 예외 발생: {e}")
+        print(f" [오류] on_message 처리 중 예외 발생: {e}")
 
 # --- MQTT 클라이언트 실행 ---
 client = mqtt.Client()

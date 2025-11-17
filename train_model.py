@@ -9,16 +9,14 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import IsolationForest
 import joblib
 
-print("--- 하이브리드 위험 예측 모델 ---")
+print("--- 하이브리드 위험 예측 모델 훈련 ---")
 
 # =============================================================================
-# 파트 1: 규칙 기반 모델 (분류기)
+# 파트 1: 규칙 기반 모델 (분류기) 및 특징 공학용 함수
 # =============================================================================
-print("\n[파트 1: 규칙 기반 모델 (분류기)]")
-print("설명: '이상'으로 판단된 데이터가 '열사병'인지 '저체온증'인지 분류합니다.")
+print("\n[파트 1: 규칙 기반 모델 (분류기) 정의]")
 
-# 체감온도 표 데이터 (기온: {습도: 체감온도})
-# 표에 있는 25°C ~ 40°C 및 25% ~ 100% 데이터 전체를 포함합니다.
+# 체감온도 표 데이터
 WIND_CHILL_DATA = {
     25: {25: 22.2, 30: 22.8, 35: 23.3, 40: 23.8, 45: 24.2, 50: 24.6, 55: 25.1, 60: 25.5, 65: 25.9, 70: 26.2, 75: 26.6, 80: 27.0, 85: 27.3, 90: 27.7, 95: 28.0, 100: 28.4},
     26: {25: 23.1, 30: 23.7, 35: 24.2, 40: 24.7, 45: 25.2, 50: 25.6, 55: 26.0, 60: 26.5, 65: 26.9, 70: 27.2, 75: 27.6, 80: 28.0, 85: 28.4, 90: 28.7, 95: 29.1, 100: 29.4},
@@ -39,83 +37,49 @@ WIND_CHILL_DATA = {
 }
 
 def get_wind_chill(env_temp, env_humidity):
-    """
-    제공된 표에서 기온과 습도에 해당하는 체감온도를 조회합니다.
-    기온은 가장 가까운 정수로, 습도는 가장 가까운 5의 배수로 반올림하여 근사값을 찾습니다.
-    """
-    # 1. 기온 (env_temp)을 가장 가까운 정수로 반올림
+    """ Key 에러 방지를 위해 .get() 사용 """
     rounded_temp = int(round(env_temp))
-
-    # 2. 기온 경계값 (25°C 미만, 40°C 초과) 처리
     if rounded_temp < 25 or rounded_temp > 40:
-        return None  # 표 데이터 범위를 벗어남
-
-    temp_data = WIND_CHILL_DATA[rounded_temp]
-
-    # 3. 습도 (env_humidity)를 가장 가까운 5의 배수로 반올림
-    rounded_humidity = int(round(env_humidity / 5.0) * 5)
-
-    # 4. 습도 경계값 (25% 미만, 100% 초과) 처리
-    if rounded_humidity < 25:
-        return None;
-    if rounded_humidity > 100:
-        return None;
-
-    # 5. 조회된 습도값이 데이터에 있는지 확인 및 체감온도 반환
-    if rounded_humidity in temp_data:
-        return temp_data[rounded_humidity]
-    else:
         return None
+    temp_data = WIND_CHILL_DATA.get(rounded_temp) # .get()으로 변경
+    if temp_data is None:
+        return None
+        
+    rounded_humidity = int(round(env_humidity / 5.0) * 5)
+    if rounded_humidity < 25:
+        return None
+    if rounded_humidity > 100:
+        rounded_humidity = 100
+        
+    return temp_data.get(rounded_humidity) # .get()으로 변경
+
+def get_effective_env_temp(env_temp, env_humidity):
+    """ 환경 온/습도 결합하여 체감온도 구한다 or 저온환경이면 그냥 온도 """
+    if env_temp >= 25.0:
+        wind_chill = get_wind_chill(env_temp, env_humidity)
+        if wind_chill is not None:
+            return wind_chill
+        else:
+            return env_temp # 표 범위 밖 고온은 기온 자체 사용
+    else:
+        # 저온/일반 환경 (풍속 데이터 없으므로 기온 자체 사용)
+        return env_temp
 
 def classify_risk_rules(body_temp, heart_rate, env_temp, env_humidity):
-    """
-    규칙 기반으로 위험 상태를 분류하는 함수.
-    고온 환경 기준은 기온(env_temp)과 습도(env_humidity)로 계산된 체감온도를 사용합니다.
-    """
-    # 1. 체감온도 계산 또는 조회
-    wind_chill = get_wind_chill(env_temp, env_humidity)
+    
+    # 유효 환경 온도 계산
+    effective_env_temp = get_effective_env_temp(env_temp, env_humidity)
 
-    # 표에 없는 온도/습도 조합일 경우 기존 env_temp 기준을 사용
-    if wind_chill is None:
-        effective_env_temp = env_temp
-    else:
-        effective_env_temp = wind_chill
+    HIGH_ENV_TEMP = 31.0   # 고온 환경 기준 (섭씨)
+    LOW_ENV_TEMP = 4.0     # 저온 환경 기준 (섭씨)
+    HIGH_WRIST_TEMP_DANGER = 35.0 # 고체온 위험 기준
+    LOW_WRIST_TEMP_DANGER = 33.0  # 저체온 위험 기준
 
-# 임계값 정의
-# 일사병 심부체온 37~40도
-# 열사병 심부체온 40도 이상
-
-# 저체온증 심부체온 35도 이하
-
-# 체감온도 31도 이상
-# >> 온열질환 예방조치 해야하는 환경
-# https://www.kosha.or.kr/kosha/business/heatWaveTemperature.do
-# >> 그냥 환경온도 31도로 잡자
-
-# 한랭작업환경
-# >> 등가냉각온도 측정해야함(풍량)
-# >> 4도 이하면 보호구 착용해야하니까 4도 기준으로 하자
-# W-17-2015 한랭작업환경 관리지침.pdf
-
-    HIGH_ENV_TEMP = 31.0  # 고온 환경 기준 (섭씨)
-    LOW_ENV_TEMP = 4.0   # 저온 환경 기준 (섭씨)
-    HIGH_WRIST_TEMP_DANGER = 35.0 # 고체온 위험 기준(대충 -2도 정도 했음)
-    LOW_WRIST_TEMP_DANGER = 33.0  # 저체온 위험 기준(대충 -2도 정도 했음)
-
-    # 규칙 기반 분류(case 4개)
-    # 고온환경 고열, 저온환경 저열, 일반환경 고/저열, 고/저온환경 일반온도, 이상
+    # 규칙 기반 분류
     if effective_env_temp >= HIGH_ENV_TEMP and body_temp >= HIGH_WRIST_TEMP_DANGER:
         return "열사병 위험"
     elif env_temp <= LOW_ENV_TEMP and body_temp <= LOW_WRIST_TEMP_DANGER:
         return "저체온증 위험"
-    elif body_temp >= HIGH_WRIST_TEMP_DANGER:
-      return "일반환경 고열"
-    elif body_temp <= LOW_WRIST_TEMP_DANGER:
-      return "일반환경 저열"
-    elif effective_env_temp >= HIGH_ENV_TEMP:
-      return "고온환경 일반온도"
-    elif env_temp <= LOW_ENV_TEMP:
-      return "저온환경 일반온도"
     else:
       return "원인 불명 이상치"
 
@@ -125,25 +89,44 @@ print("규칙 기반 분류 함수(classify_risk_rules)가 정의되었습니다
 # =============================================================================
 # 파트 2: 이상 감지 모델 (Anomaly Detection Model)
 # =============================================================================
-print("\n[파트 2: 이상 감지 모델 (Isolation Forest)]")
+print("\n[파트 2: 이상 감지 모델 (Isolation Forest) 훈련]")
 print("설명: '정상' 데이터가 어떤 것인지 학습하는 AI 모델을 정의하고 훈련합니다.")
 
 # --- 2.1 '정상' 데이터 준비 ---
-# training_dataset.csv 파일을 로드하여 학습 데이터로 사용합니다.
 df = pd.read_csv('training_dataset.csv')
-X_normal = df[['mean.WristT_5', 'mean.hr_5', 'mean.Temperature_60', 'mean.Humidity_60']]
-X_normal = X_normal.dropna()
-X_normal.columns = ['body_temp', 'heart_rate', 'env_temp', 'env_humidity']
-print(f"'training_dataset.csv'에서 {len(X_normal)}개의 '정상' 데이터를 로드했습니다.")
+# **수정**: 원본 4개 컬럼을 X_temp에 임시 저장
+X_temp = df[['mean.WristT_5', 'mean.hr_5', 'mean.Temperature_60', 'mean.Humidity_60']].copy()
+X_temp.columns = ['body_temp', 'heart_rate', 'env_temp', 'env_humidity']
+X_temp = X_temp.dropna()
 
-if X_normal.empty:
+if X_temp.empty:
     print("경고: CSV 파일에서 유효한 데이터를 찾을 수 없습니다.")
+    exit()
+
+print(f"'training_dataset.csv'에서 {len(X_temp)}개의 '정상' 데이터를 로드했습니다.")
+
+# --- 2.2 특징 공학 (Feature Engineering) ---
+print("특징 공학 적용 중... (Temp Diff 계산)")
+
+# 1. 유효 환경 스트레스 온도(Effective Env Temp) 계산
+X_temp['effective_env_temp'] = X_temp.apply(
+    lambda row: get_effective_env_temp(row['env_temp'], row['env_humidity']),
+    axis=1
+)
+
+# 2. 핵심 변환 특징: 체온 - 유효 환경온도 차이 (Temp Diff)
+X_temp['temp_diff'] = X_temp['body_temp'] - X_temp['effective_env_temp']
+
+# 3. Isolation Forest에 사용할 최종 특징 선택
+# 4개 -> 2개 (심박수와 온도 차이)
+X_train_features = X_temp[['heart_rate', 'temp_diff']]
+print("AI 모델 훈련 특징: ['heart_rate', 'temp_diff']")
 
 
-# --- 2.2 모델 및 스케일러 정의 및 훈련 ---
+# --- 2.3 모델 및 스케일러 정의 및 훈련 ---
 # 1. 스케일러 (Scaler) 정의 및 훈련
 scaler = StandardScaler()
-X_normal_scaled = scaler.fit_transform(X_normal)
+X_normal_scaled = scaler.fit_transform(X_train_features)
 print("데이터 스케일러(StandardScaler) 훈련 완료.")
 
 # 2. 이상 감지 모델 (IsolationForest) 정의 및 훈련

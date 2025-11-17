@@ -5,7 +5,7 @@ import json
 import joblib
 import pandas as pd
 import numpy as np
-import time # 환경 데이터 타임스탬프용
+import time
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import IsolationForest
 
@@ -13,9 +13,9 @@ print("--- 하이브리드 위험 예측 서버 (MQTT) ---")
 print("모델과 스케일러를 로드합니다...")
 
 # =============================================================================
-# 파트 1: 규칙 기반 모델 (분류기) - (기존 코드 복사)
+# 파트 1: 규칙 기반 모델 (분류기)
 # =============================================================================
-# (예측에 필요하므로 기존 코드를 그대로 가져옵니다)
+# (AI 학습 및 예측에 모두 필요하므로 훈련 스크립트와 동일하게 정의)
 
 WIND_CHILL_DATA = {
     25: {25: 22.2, 30: 22.8, 35: 23.3, 40: 23.8, 45: 24.2, 50: 24.6, 55: 25.1, 60: 25.5, 65: 25.9, 70: 26.2, 75: 26.6, 80: 27.0, 85: 27.3, 90: 27.7, 95: 28.0, 100: 28.4},
@@ -37,67 +37,93 @@ WIND_CHILL_DATA = {
 }
 
 def get_wind_chill(env_temp, env_humidity):
+    """ (수정됨) Key 에러 방지를 위해 .get() 사용 """
     rounded_temp = int(round(env_temp))
     if rounded_temp < 25 or rounded_temp > 40:
         return None
-    temp_data = WIND_CHILL_DATA.get(rounded_temp) # .get()으로 변경하여 Key 에러 방지
+    temp_data = WIND_CHILL_DATA.get(rounded_temp) # .get()으로 변경
     if temp_data is None:
         return None
         
     rounded_humidity = int(round(env_humidity / 5.0) * 5)
     if rounded_humidity < 25:
-        return None # 25 미만 데이터는 표에 없음
+        return None
     if rounded_humidity > 100:
-        rounded_humidity = 100 # 100 초과 시 100으로 간주
+        rounded_humidity = 100
         
     return temp_data.get(rounded_humidity) # .get()으로 변경
 
-def classify_risk_rules(body_temp, heart_rate, env_temp, env_humidity):
-    wind_chill = get_wind_chill(env_temp, env_humidity)
-    if wind_chill is None:
-        effective_env_temp = env_temp
+def get_effective_env_temp(env_temp, env_humidity):
+    """ (신규 추가) 유효 환경 스트레스 온도 계산 함수 """
+    if env_temp >= 25.0:
+        wind_chill = get_wind_chill(env_temp, env_humidity)
+        if wind_chill is not None:
+            return wind_chill
+        else:
+            return env_temp # 표 범위 밖 고온은 기온 자체 사용
     else:
-        effective_env_temp = wind_chill
-    HIGH_ENV_TEMP = 31.0
-    LOW_ENV_TEMP = 4.0
-    HIGH_WRIST_TEMP_DANGER = 35.0
-    LOW_WRIST_TEMP_DANGER = 33.0
+        # 저온/일반 환경 (풍속 데이터 없으므로 기온 자체 사용)
+        return env_temp
+
+def classify_risk_rules(body_temp, heart_rate, env_temp, env_humidity):
+    """ (수정됨) 유효 환경 스트레스 온도를 사용하도록 변경 """
+    
+    # **수정**: 유효 환경 온도 계산
+    effective_env_temp = get_effective_env_temp(env_temp, env_humidity)
+
+    HIGH_ENV_TEMP = 31.0   # 고온 환경 기준 (섭씨)
+    LOW_ENV_TEMP = 4.0     # 저온 환경 기준 (섭씨)
+    HIGH_WRIST_TEMP_DANGER = 35.0 # 고체온 위험 기준
+    LOW_WRIST_TEMP_DANGER = 33.0  # 저체온 위험 기준
+
+    # 규칙 기반 분류
     if effective_env_temp >= HIGH_ENV_TEMP and body_temp >= HIGH_WRIST_TEMP_DANGER:
         return "열사병 위험"
     elif env_temp <= LOW_ENV_TEMP and body_temp <= LOW_WRIST_TEMP_DANGER:
         return "저체온증 위험"
-    elif body_temp >= HIGH_WRIST_TEMP_DANGER:
-        return "일반환경 고열"
-    elif body_temp <= LOW_WRIST_TEMP_DANGER:
-        return "일반환경 저열"
-    elif effective_env_temp >= HIGH_ENV_TEMP:
-        return "고온환경 일반온도"
-    elif env_temp <= LOW_ENV_TEMP:
-        return "저온환경 일반온도"
     else:
-        return "원인 불명 이상치"
+      return "원인 불명 이상치"
+
 
 # =============================================================================
-# 파트 2: 하이브리드 예측 함수
+# 파트 2: 하이브리드 예측 함수 (***핵심 수정***)
 # =============================================================================
 def predict_hybrid(data_list, fitted_scaler, fitted_model):
+    """ (수정됨) 훈련 시와 동일한 특징 공학(Temp Diff)을 적용하여 예측 """
     results = []
+    # 1. 원본 4개 데이터로 DataFrame 생성
     df_data = pd.DataFrame(data_list, columns=['body_temp', 'heart_rate', 'env_temp', 'env_humidity'])
     
-    # 입력 데이터 유효성 검사 (모델 입력 전)
+    # 2. 입력 데이터 유효성 검사
     for col in df_data.columns:
         if df_data[col].isnull().any() or not np.all(np.isfinite(df_data[col])):
-             print(f"[예측 오류] 입력 데이터에 Null 또는 비유한 값이 있습니다: {data_list}")
-             return [f"데이터 오류 ({col})"]
+            print(f"[예측 오류] 입력 데이터에 Null 또는 비유한 값이 있습니다: {data_list}")
+            return [f"데이터 오류 ({col})"]
 
-    data_scaled = fitted_scaler.transform(df_data)
+    # 3. 특징 공학 (Feature Engineering) 적용 (훈련 시와 동일)
+    # 3-1. 유효 환경 스트레스 온도 계산
+    df_data['effective_env_temp'] = df_data.apply(
+        lambda row: get_effective_env_temp(row['env_temp'], row['env_humidity']),
+        axis=1
+    )
+    # 3-2. Temp Diff 계산
+    df_data['temp_diff'] = df_data['body_temp'] - df_data['effective_env_temp']
+    
+    # 4. AI 모델 입력 특징 선택 (훈련 시 사용한 2개)
+    X_predict_features = df_data[['heart_rate', 'temp_diff']]
+    
+    # 5. 스케일링 및 예측
+    data_scaled = fitted_scaler.transform(X_predict_features)
     anomaly_predictions = fitted_model.predict(data_scaled)
 
+    # 6. 결과 해석
     for i in range(len(df_data)):
         if anomaly_predictions[i] == 1:
             results.append("정상 (Normal)")
         else:
+            # AI가 이상치로 판단하면, 규칙 기반 분류기(If문)가 위험 종류 판단
             row = df_data.iloc[i]
+            # (주의: 규칙 분류 함수는 원본 4개 특징을 모두 사용)
             rule_result = classify_risk_rules(row['body_temp'], row['heart_rate'], row['env_temp'], row['env_humidity'])
             results.append(rule_result)
     return results
@@ -106,7 +132,6 @@ def predict_hybrid(data_list, fitted_scaler, fitted_model):
 # 파트 3: 저장된 모델/스케일러 로드
 # =============================================================================
 try:
-    # 1단계에서 저장한 파일들을 불러옵니다.
     scaler = joblib.load('scaler.joblib')
     model = joblib.load('model.joblib')
     print("모델과 스케일러 로드 성공.")
@@ -116,32 +141,22 @@ except FileNotFoundError:
     exit()
 
 # =============================================================================
-# 파트 4: 서버 상태 관리
+# 파트 4: 서버 상태 관리 (기존 코드 유지)
 # =============================================================================
 
-# 비콘 Key를 환경 이름으로 매핑하는 딕셔너리
-# Key: "Major-Minor"
-# Value: "환경 이름"
 BEACON_TO_ENV_MAP = {
-    "40011-55612": "환경 1 (고온)", # 사용자가 요청한 비콘
-    "9999-1": "환경 2 (저온)",    # 더미값 1
-    "9999-2": "환경 3 (일반)",    # 더미값 2
+    "40011-55612": "환경 1 (고온)",
+    "9999-1": "환경 2 (저온)",
+    "9999-2": "환경 3 (일반)",
 }
-
-# 환경 데이터를 실시간 저장할 딕셔너리 (Key: "환경 이름", Value: {온습도, 타임스탬프})
 environment_state = {} 
-# 예: {'환경 1 (고온)': {'env_temp': 40.5, 'env_humi': 15.2, 'last_updated': 1678886400.0}}
-
-# 환경 데이터가 이 시간(초)보다 오래되면 '오래된 데이터'로 간주함
-ENV_DATA_TIMEOUT_SECONDS = 1000.0 # 30초 (30초 이상 갱신이 안되면 해당 데이터 사용 안함)
-
+ENV_DATA_TIMEOUT_SECONDS = 30.0 # 타임아웃 30초로 수정 (기존 값은 너무 길었음)
 
 # =============================================================================
-# 파트 5: MQTT 메시지 핸들러
+# 파트 5: MQTT 메시지 핸들러 (기존 코드 유지)
 # =============================================================================
 
 def handle_env_message(data):
-    """ 'env/data' 토픽의 메시지를 처리하여 environment_state를 갱신합니다. """
     try:
         major = data.get('beacon_major')
         minor = data.get('beacon_minor')
@@ -149,10 +164,7 @@ def handle_env_message(data):
             print(f" [환경 데이터 오류] 비콘 ID(Major/Minor)가 없습니다: {data}")
             return
 
-        # Key를 "Major-Minor" 형태의 문자열로 생성
         beacon_key = f"{major}-{minor}" 
-        
-        # 비콘 Key를 환경 이름으로 변환
         env_name = BEACON_TO_ENV_MAP.get(beacon_key)
         if env_name is None:
             print(f" [환경 데이터 경고] 매핑되지 않은 비콘 ID입니다: {beacon_key}")
@@ -165,7 +177,6 @@ def handle_env_message(data):
             print(f" [환경 데이터 오류] 온습도 값이 없습니다: {data}")
             return
             
-        # 딕셔너리 업데이트 (Key: env_name)
         environment_state[env_name] = {
             'env_temp': temp,
             'env_humi': humi,
@@ -178,7 +189,6 @@ def handle_env_message(data):
         print(f" [오류] handle_env_message 처리 중 예외 발생: {e}")
 
 def handle_vest_message(client, data):
-    """ 'vest/data' 토픽의 메시지를 처리하여 예측 및 경보를 수행합니다. """
     try:
         # 1. 조끼 데이터 추출
         mcu_id = data.get('mcu_id')
@@ -198,14 +208,11 @@ def handle_vest_message(client, data):
             print(f" └ [오류] {mcu_id}가 스캔한 비콘이 없습니다. 위치를 매핑할 수 없습니다.")
             return
 
-        # RSSI가 가장 높은 비콘 찾기 (신호가 가장 강한 비콘 = 현재 위치)
-        # RSSI는 음수이므로, max() 함수가 가장 0에 가까운 값을 찾음
         strongest_beacon = max(scanned_beacons, key=lambda b: b['rssi'])
         major = strongest_beacon.get('major')
         minor = strongest_beacon.get('minor')
         beacon_key = f"{major}-{minor}"
         
-        # 비콘 Key를 환경 이름으로 변환
         env_name = BEACON_TO_ENV_MAP.get(beacon_key)
         
         print(f" └ [위치 매핑] 가장 강한 비콘: {beacon_key} -> {env_name if env_name else '알 수 없는 환경'}")
@@ -214,15 +221,13 @@ def handle_vest_message(client, data):
             print(f" └ [오류] {mcu_id}가 스캔한 비콘({beacon_key})을 환경에 매핑할 수 없습니다.")
             return
 
-        # 3. 환경 데이터 융합 (State에서 조회)
-        # env_name을 Key로 사용하여 조회
+        # 3. 환경 데이터 융합
         env_data = environment_state.get(env_name)
         if env_data is None:
             print(f" └ [오류] '{env_name}'({beacon_key})에 해당하는 환경 정보가 서버에 없습니다.")
             print(f" └ (현재 서버 상태: {list(environment_state.keys())})")
             return
         
-        # 타임스탬프 검사 (오래된 데이터 방지)
         current_time = time.time()
         data_age = current_time - env_data.get('last_updated', 0)
         
@@ -236,15 +241,15 @@ def handle_vest_message(client, data):
         
         # 4. 최종 예측 (IMU 우선)
         final_prediction = ""
-        if is_fell == 1: # 또는 True
+        if is_fell == 1:
             final_prediction = "낙상 의심 (IMU)"
         else:
-            # 5. 하이브리드 모델 예측 (IMU 정상이면)
-            # 입력 데이터 유효성 검사 (HR=0, Temp=0 등은 모델 에러 유발 가능)
+            # 5. 하이브리드 모델 예측
             if body_temp is None or hr is None or env_temp is None or env_humi is None:
                 print(f" └ [오류] 예측에 필요한 데이터가 누락되었습니다 (Body/HR/Env).")
                 return
                 
+            # **수정 없음**: predict_hybrid 함수가 내부적으로 특징 공학을 수행함
             input_data = [[body_temp, hr, env_temp, env_humi]]
             prediction_result = predict_hybrid(input_data, scaler, model)
             final_prediction = prediction_result[0]
@@ -252,14 +257,12 @@ def handle_vest_message(client, data):
         print(f" └ [최종 예측 결과]: >>> {final_prediction} <<<")
 
         # 6. 조치 수행 (경보 또는 정상 신호 전송)
-        alert_topic = f"vest/alert/{mcu_id}" # 조끼가 구독 중인 고유 토픽
+        alert_topic = f"vest/alert/{mcu_id}"
 
         if final_prediction != "정상 (Normal)":
-            # 6-1. 위험! 조끼에 "ALERT" 전송
             client.publish(alert_topic, "ALERT")
             print(f" └ [조치] {mcu_id} 조끼로 'ALERT' ({final_prediction}) 전송 완료.")
         else:
-            # 6-2. 정상! 조끼에 "NORMAL" 전송
             client.publish(alert_topic, "NORMAL")
             print(f" └ [조치] {mcu_id} 조끼로 'NORMAL' 전송 완료.")
         
@@ -268,45 +271,33 @@ def handle_vest_message(client, data):
 
 
 # =============================================================================
-# 파트 6: MQTT 설정 및 실행
+# 파트 6: MQTT 설정 및 실행 (기존 코드 유지)
 # =============================================================================
 
-# --- MQTT 설정 ---
 MQTT_BROKER_HOST = 'broker.hivemq.com'
 MQTT_BROKER_PORT = 1883
-
-# [수정됨] 구독할 토픽 목록
 MQTT_SUB_TOPICS = [
-    ("vest/data", 0),  # 조끼 데이터
-    ("env/data", 0)    # 환경 데이터
+    ("vest/data", 0),
+    ("env/data", 0)
 ]
-# ------------------------------------
 
-# MQTT 클라이언트가 브로커에 연결되었을 때 호출될 함수
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print(f"MQTT 브로커에 연결되었습니다 (Host: {MQTT_BROKER_HOST})")
-        # 여러 토픽 구독
         client.subscribe(MQTT_SUB_TOPICS)
         print(f"'{MQTT_SUB_TOPICS[0][0]}' 및 '{MQTT_SUB_TOPICS[1][0]}' 토픽을 구독합니다.")
     else:
         print(f"MQTT 연결 실패 (Code: {rc})")
 
-# MQTT 메시지(데이터)를 수신했을 때 호출될 함수 (로직 분기)
 def on_message(client, userdata, msg):
-    # print(f"\n[{msg.topic}] 메시지 수신:") # 로그가 너무 많아질 수 있으므로, 각 핸들러에서 출력
-    
     try:
-        # 1. 메시지(payload)를 문자열로 디코딩 및 JSON 파싱
         payload_str = msg.payload.decode('utf-8')
         data = json.loads(payload_str)
         
-        # 2. 토픽에 따라 핸들러 분기
         if msg.topic == "env/data":
             handle_env_message(data)
             
         elif msg.topic == "vest/data":
-            # client 객체를 넘겨주어 publish(경보 전송)가 가능하도록 함
             handle_vest_message(client, data)
 
     except json.JSONDecodeError:
@@ -314,15 +305,12 @@ def on_message(client, userdata, msg):
     except Exception as e:
         print(f" [오류] on_message 처리 중 예외 발생: {e}")
 
-# --- MQTT 클라이언트 실행 ---
 client = mqtt.Client()
-client.on_connect = on_connect  # 연결 콜백 함수 지정
-client.on_message = on_message  # 메시지 수신 콜백 함수 지정
+client.on_connect = on_connect
+client.on_message = on_message
 
 try:
     client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, 60)
-    # 60초 동안 메세지 안오면 연결 확인 상태 메세지 보냄
-    # loop_forever(): 스크립트가 종료되지 않고 계속 실행되며 MQTT 메시지를 기다림
     print(f"'{MQTT_BROKER_HOST}'에 연결을 시도합니다...")
     client.loop_forever()
 

@@ -1,6 +1,8 @@
 """
-'정상' 데이터로 학습된 '이상 감지 모델'과
-'열사병/저체온증'을 분류하는 '규칙 기반 모델'을 결합
+[Train Model] 2D AI 모델 훈련 (체온, 심박수)
+설명: 정상 데이터셋에서 '체온'과 '심박수'의 정상 패턴만 학습합니다.
+환경 변수는 학습하지 않으므로, 낯선 환경에서도 체온/심박이 정상이면 '정상'으로 판단하지만,
+환경 적응으로 체온이 변하면 '이상치'로 판단하여 2차 휴리스틱으로 넘깁니다.
 """
 
 import pandas as pd
@@ -9,137 +11,49 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import IsolationForest
 import joblib
 
-print("--- 하이브리드 위험 예측 모델 훈련 ---")
+print("--- [훈련 시작] 2D AI 모델 (BodyTemp, HeartRate) ---")
 
-# =============================================================================
-# 파트 1: 규칙 기반 모델 (분류기) 및 특징 공학용 함수
-# =============================================================================
-print("\n[파트 1: 규칙 기반 모델 (분류기) 정의]")
-
-# 체감온도 표 데이터
-WIND_CHILL_DATA = {
-    25: {25: 22.2, 30: 22.8, 35: 23.3, 40: 23.8, 45: 24.2, 50: 24.6, 55: 25.1, 60: 25.5, 65: 25.9, 70: 26.2, 75: 26.6, 80: 27.0, 85: 27.3, 90: 27.7, 95: 28.0, 100: 28.4},
-    26: {25: 23.1, 30: 23.7, 35: 24.2, 40: 24.7, 45: 25.2, 50: 25.6, 55: 26.0, 60: 26.5, 65: 26.9, 70: 27.2, 75: 27.6, 80: 28.0, 85: 28.4, 90: 28.7, 95: 29.1, 100: 29.4},
-    27: {25: 24.0, 30: 24.6, 35: 25.2, 40: 25.7, 45: 26.1, 50: 26.6, 55: 27.0, 60: 27.5, 65: 27.9, 70: 28.2, 75: 28.6, 80: 29.0, 85: 29.4, 90: 29.7, 95: 30.1, 100: 30.5},
-    28: {25: 24.9, 30: 25.5, 35: 26.1, 40: 26.6, 45: 27.0, 50: 27.5, 55: 28.0, 60: 28.4, 65: 28.9, 70: 29.3, 75: 29.7, 80: 30.0, 85: 30.4, 90: 30.8, 95: 31.1, 100: 31.5},
-    29: {25: 25.8, 30: 26.5, 35: 27.0, 40: 27.6, 45: 28.1, 50: 28.6, 55: 29.0, 60: 29.4, 65: 29.9, 70: 30.3, 75: 30.7, 80: 31.1, 85: 31.4, 90: 31.8, 95: 32.2, 100: 32.6},
-    30: {25: 26.7, 30: 27.4, 35: 28.0, 40: 28.5, 45: 29.0, 50: 29.5, 55: 30.0, 60: 30.4, 65: 30.9, 70: 31.3, 75: 31.7, 80: 32.1, 85: 32.5, 90: 32.9, 95: 33.2, 100: 33.6},
-    31: {25: 27.6, 30: 28.3, 35: 28.9, 40: 29.4, 45: 30.0, 50: 30.5, 55: 31.0, 60: 31.4, 65: 31.9, 70: 32.3, 75: 32.7, 80: 33.1, 85: 33.5, 90: 33.9, 95: 34.3, 100: 34.6},
-    32: {25: 28.5, 30: 29.2, 35: 29.8, 40: 30.4, 45: 31.0, 50: 31.5, 55: 32.0, 60: 32.4, 65: 32.9, 70: 33.3, 75: 33.7, 80: 34.1, 85: 34.5, 90: 34.9, 95: 35.3, 100: 35.7},
-    33: {25: 29.5, 30: 30.2, 35: 30.8, 40: 31.4, 45: 32.0, 50: 32.5, 55: 33.0, 60: 33.5, 65: 33.9, 70: 34.3, 75: 34.8, 80: 35.2, 85: 35.6, 90: 36.0, 95: 36.4, 100: 36.7},
-    34: {25: 30.4, 30: 31.1, 35: 31.8, 40: 32.4, 45: 32.9, 50: 33.5, 55: 34.0, 60: 34.5, 65: 34.9, 70: 35.4, 75: 35.8, 80: 36.2, 85: 36.6, 90: 37.0, 95: 37.4, 100: 37.8},
-    35: {25: 31.3, 30: 32.0, 35: 32.7, 40: 33.3, 45: 33.9, 50: 34.5, 55: 35.0, 60: 35.5, 65: 35.9, 70: 36.4, 75: 36.8, 80: 37.2, 85: 37.7, 90: 38.1, 95: 38.5, 100: 38.9},
-    36: {25: 32.2, 30: 33.0, 35: 33.7, 40: 34.3, 45: 34.9, 50: 35.4, 55: 36.0, 60: 36.5, 65: 36.9, 70: 37.4, 75: 37.8, 80: 38.3, 85: 38.7, 90: 39.1, 95: 39.5, 100: 40.0},
-    37: {25: 33.1, 30: 33.9, 35: 34.6, 40: 35.3, 45: 35.9, 50: 36.4, 55: 37.0, 60: 37.5, 65: 38.0, 70: 38.4, 75: 38.9, 80: 39.3, 85: 39.7, 90: 40.2, 95: 40.6, 100: 41.0},
-    38: {25: 34.0, 30: 34.8, 35: 35.6, 40: 36.2, 45: 36.9, 50: 37.4, 55: 38.0, 60: 38.5, 65: 39.0, 70: 39.5, 75: 39.9, 80: 40.4, 85: 40.8, 90: 41.2, 95: 41.6, 100: 42.0},
-    39: {25: 35.0, 30: 35.8, 35: 36.5, 40: 37.2, 45: 37.8, 50: 38.4, 55: 39.0, 60: 39.5, 65: 40.0, 70: 40.5, 75: 40.9, 80: 41.4, 85: 41.8, 90: 42.3, 95: 42.7, 100: 43.1},
-    40: {25: 35.9, 30: 36.7, 35: 37.5, 40: 38.2, 45: 38.8, 50: 39.4, 55: 40.0, 60: 40.5, 65: 41.0, 70: 41.5, 75: 42.0, 80: 42.4, 85: 42.8, 90: 43.3, 95: 43.7, 100: 44.1}
-}
-
-def get_wind_chill(env_temp, env_humidity):
-    """ Key 에러 방지를 위해 .get() 사용 """
-    rounded_temp = int(round(env_temp))
-    if rounded_temp < 25 or rounded_temp > 40:
-        return None
-    temp_data = WIND_CHILL_DATA.get(rounded_temp) # .get()으로 변경
-    if temp_data is None:
-        return None
-        
-    rounded_humidity = int(round(env_humidity / 5.0) * 5)
-    if rounded_humidity < 25:
-        return None
-    if rounded_humidity > 100:
-        rounded_humidity = 100
-        
-    return temp_data.get(rounded_humidity) # .get()으로 변경
-
-def get_effective_env_temp(env_temp, env_humidity):
-    """ 환경 온/습도 결합하여 체감온도 구한다 or 저온환경이면 그냥 온도 """
-    if env_temp >= 25.0:
-        wind_chill = get_wind_chill(env_temp, env_humidity)
-        if wind_chill is not None:
-            return wind_chill
-        else:
-            return env_temp # 표 범위 밖 고온은 기온 자체 사용
-    else:
-        # 저온/일반 환경 (풍속 데이터 없으므로 기온 자체 사용)
-        return env_temp
-
-def classify_risk_rules(body_temp, heart_rate, env_temp, env_humidity):
-    
-    # 유효 환경 온도 계산
-    effective_env_temp = get_effective_env_temp(env_temp, env_humidity)
-
-    HIGH_ENV_TEMP = 31.0   # 고온 환경 기준 (섭씨)
-    LOW_ENV_TEMP = 4.0     # 저온 환경 기준 (섭씨)
-    HIGH_WRIST_TEMP_DANGER = 35.0 # 고체온 위험 기준
-    LOW_WRIST_TEMP_DANGER = 33.0  # 저체온 위험 기준
-
-    # 규칙 기반 분류
-    if effective_env_temp >= HIGH_ENV_TEMP and body_temp >= HIGH_WRIST_TEMP_DANGER:
-        return "열사병 위험"
-    elif env_temp <= LOW_ENV_TEMP and body_temp <= LOW_WRIST_TEMP_DANGER:
-        return "저체온증 위험"
-    else:
-      return "원인 불명 이상치"
-
-print("규칙 기반 분류 함수(classify_risk_rules)가 정의되었습니다.")
-
-
-# =============================================================================
-# 파트 2: 이상 감지 모델 (Anomaly Detection Model)
-# =============================================================================
-print("\n[파트 2: 이상 감지 모델 (Isolation Forest) 훈련]")
-print("설명: '정상' 데이터가 어떤 것인지 학습하는 AI 모델을 정의하고 훈련합니다.")
-
-# --- 2.1 '정상' 데이터 준비 ---
-df = pd.read_csv('training_dataset.csv')
-# **수정**: 원본 4개 컬럼을 X_temp에 임시 저장
-X_temp = df[['mean.WristT_5', 'mean.hr_5', 'mean.Temperature_60', 'mean.Humidity_60']].copy()
-X_temp.columns = ['body_temp', 'heart_rate', 'env_temp', 'env_humidity']
-X_temp = X_temp.dropna()
-
-if X_temp.empty:
-    print("경고: CSV 파일에서 유효한 데이터를 찾을 수 없습니다.")
+# 1. 데이터 로드
+try:
+    df = pd.read_csv('training_dataset.csv')
+    print(f">> 데이터 로드 성공: {len(df)} 행")
+except FileNotFoundError:
+    print("[오류] 'training_dataset.csv' 파일이 없습니다.")
     exit()
 
-print(f"'training_dataset.csv'에서 {len(X_temp)}개의 '정상' 데이터를 로드했습니다.")
+# 2. 학습에 사용할 2가지 특징 선택 (환경 변수 제외!)
+# mean.WristT_5 -> body_temp
+# mean.hr_5     -> heart_rate
+train_df = pd.DataFrame()
+train_df['body_temp'] = df['mean.WristT_5']
+train_df['heart_rate'] = df['mean.hr_5']
 
-# --- 2.2 특징 공학 (Feature Engineering) ---
-print("특징 공학 적용 중... (Temp Diff 계산)")
+# 3. 결측치 제거
+original_len = len(train_df)
+train_df = train_df.dropna()
+print(f">> 결측치 제거: {original_len} -> {len(train_df)} 샘플 사용")
 
-# 1. 유효 환경 스트레스 온도(Effective Env Temp) 계산
-X_temp['effective_env_temp'] = X_temp.apply(
-    lambda row: get_effective_env_temp(row['env_temp'], row['env_humidity']),
-    axis=1
-)
+if train_df.empty:
+    print("[오류] 학습할 유효한 데이터가 없습니다.")
+    exit()
 
-# 2. 핵심 변환 특징: 체온 - 유효 환경온도 차이 (Temp Diff)
-X_temp['temp_diff'] = X_temp['body_temp'] - X_temp['effective_env_temp']
-
-# 3. Isolation Forest에 사용할 최종 특징 선택
-# 4개 -> 2개 (심박수와 온도 차이)
-X_train_features = X_temp[['heart_rate', 'temp_diff']]
-print("AI 모델 훈련 특징: ['heart_rate', 'temp_diff']")
-
-
-# --- 2.3 모델 및 스케일러 정의 및 훈련 ---
-# 1. 스케일러 (Scaler) 정의 및 훈련
+# 4. 데이터 스케일링 (StandardScaler)
+# 체온(30~36)과 심박(60~100)의 단위 차이를 맞춤
 scaler = StandardScaler()
-X_normal_scaled = scaler.fit_transform(X_train_features)
-print("데이터 스케일러(StandardScaler) 훈련 완료.")
+X_train = scaler.fit_transform(train_df)
+print(">> 데이터 스케일링 완료")
 
-# 2. 이상 감지 모델 (IsolationForest) 정의 및 훈련
-model = IsolationForest(contamination='auto', random_state=42)
-model.fit(X_normal_scaled)
-print("이상 감지 모델(IsolationForest) 훈련 완료.")
+# 5. Isolation Forest 모델 학습
+# contamination=0.01: 학습 데이터의 1% 정도는 노이즈(이상치)라고 가정
+print(">> 모델 학습 중 (Isolation Forest)...")
+model = IsolationForest(n_estimators=200, contamination="auto", random_state=42)
+model.fit(X_train)
 
-print("모델 훈련 완료. 이 모델은 이제 '정상' 상태가 무엇인지 학습했습니다.")
-
-# 훈련된 스케일러와 모델을 파일로 저장
+# 6. 모델 및 스케일러 저장
 joblib.dump(scaler, 'scaler.joblib')
-print("scaler.joblib 파일이 저장되었습니다.")
 joblib.dump(model, 'model.joblib')
-print("model.joblib 파일이 저장되었습니다.")
 
-print("\n--- 훈련 및 모델 저장 완료 ---")
+print("\n[훈련 완료]")
+print(">> 'scaler.joblib' 저장됨")
+print(">> 'model.joblib' 저장됨")
+print("이제 mqtt_listener.py를 실행하세요.")

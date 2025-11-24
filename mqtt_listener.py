@@ -8,6 +8,95 @@ import numpy as np
 import time
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import IsolationForest
+import mysql.connector
+from mysql.connector import Error
+
+# =============================================================================
+# [설정] AWS MySQL 데이터베이스 정보 입력
+# =============================================================================
+DB_CONFIG = {
+    "host": "3.106.191.215",  # AWS EC2의 퍼블릭 IP 또는 도메인
+    "user": "xjx06127",  # 위에서 생성한 유저 이름
+    "password": "pwd",  # 설정한 비밀번호
+    "database": "safety_db",  # 데이터베이스 이름
+    "port": 3306,
+}
+
+
+# =============================================================================
+# [DB 함수] 테이블 생성 및 데이터 저장 (Upsert)
+# =============================================================================
+def init_db():
+    """프로그램 시작 시 테이블이 없으면 생성"""
+    conn = None
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        if conn.is_connected():
+            cursor = conn.cursor()
+            # mcu_id를 PRIMARY KEY로 설정하여 중복 방지
+            create_table_query = """
+            CREATE TABLE IF NOT EXISTS worker_status (
+                mcu_id VARCHAR(50) PRIMARY KEY,
+                env_location VARCHAR(50),
+                env_temp FLOAT,
+                env_humidity FLOAT,
+                body_temp FLOAT,
+                heart_rate INT,
+                is_fell BOOLEAN,
+                analysis_result VARCHAR(100),
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            )
+            """
+            cursor.execute(create_table_query)
+            conn.commit()
+            print(">> [DB] 테이블 초기화 완료 (worker_status)")
+    except Error as e:
+        print(f"[DB 초기화 오류] {e}")
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
+
+
+def save_worker_status_to_db(mcu_id, location, et, eh, bt, hr, fell, result):
+    """
+    MySQL에 작업자 상태 저장 (Upsert)
+    - 이미 존재하는 mcu_id면 정보를 UPDATE
+    - 없는 mcu_id면 정보를 INSERT
+    """
+    conn = None
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        if conn.is_connected():
+            cursor = conn.cursor()
+
+            # INSERT ... ON DUPLICATE KEY UPDATE 구문 사용
+            sql = """
+            INSERT INTO worker_status 
+            (mcu_id, env_location, env_temp, env_humidity, body_temp, heart_rate, is_fell, analysis_result)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                env_location = VALUES(env_location),
+                env_temp = VALUES(env_temp),
+                env_humidity = VALUES(env_humidity),
+                body_temp = VALUES(body_temp),
+                heart_rate = VALUES(heart_rate),
+                is_fell = VALUES(is_fell),
+                analysis_result = VALUES(analysis_result),
+                last_updated = CURRENT_TIMESTAMP
+            """
+            val = (mcu_id, location, et, eh, bt, hr, fell, result)
+
+            cursor.execute(sql, val)
+            conn.commit()
+            print(f" >> [DB 저장] {mcu_id} 데이터 갱신 완료")  # 너무 빈번하면 주석 처리
+
+    except Error as e:
+        print(f"[DB 저장 오류] {e}")
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
 
 print("--- [서버 시작] 하이브리드 위험 예측 시스템 ---")
 print(">> 모델과 스케일러를 로드합니다...")
@@ -375,9 +464,9 @@ def analyze_risk_heuristics(row):
         return f"열사병 위험 (체감 {effective_env_temp:.1f}°C, 체온 {b_temp:.1f}°C)"
 
     # 심박수 이상 or 고온 저온 아닌 일반 환경에서 저체온 고체온 탐지
-    # min, max 값 안쓰는 이유는 threashold 없이 단독으로 쓰면 24도 환경에서 34도인 값도 저체온으로 판명되는 이상 경우 생김.
+    # min, max 값 안쓰는 이유는 threshold 없이 단독으로 쓰면 24도 환경에서 34도인 값도 저체온으로 판명되는 이상 경우 생김.
     # threshold를 잡아주기 애매함. 그래서 그냥 33, 35로 기준치 잡는게 나을 듯?
-    # 근데 다시 생각은 해보자..
+    # 근데 다시 생각은 해보자.. 어떻게 min, max 값 못쓰나?
     if b_temp <= 33 and hr < 50:
         return f"저체온 및 서맥 (환경 {e_temp:.1f}°C, 체온 {b_temp:.1f}°C)"
 
@@ -391,7 +480,6 @@ def analyze_risk_heuristics(row):
         return f"고체온 (체감 {effective_env_temp:.1f}°C, 체온 {b_temp:.1f}°C)"
 
     # 3. 심박수 극한 이상 체크 (환경 무관)
-    # AI가 잡았는데 심박수가 너무 극단적이면 위험
     if hr > 100:
         return f"빈맥 위험 (고심박 {hr} bpm)"
     elif hr < 50:
@@ -453,7 +541,6 @@ except FileNotFoundError:
 # =============================================================================
 # 파트 4: 서버 상태 및 MQTT 핸들러
 # =============================================================================
-
 BEACON_TO_ENV_MAP = {
     "40011-55612": "환경 1 (고온)",
     "9999-1": "환경 2 (저온)",
@@ -487,7 +574,6 @@ def handle_env_message(data):
             "last_updated": time.time(),
         }
         print(f"[환경 갱신] {env_name}: T={temp}°C, H={humi}%")
-
     except Exception as e:
         print(f"[환경 처리 오류] {e}")
 
@@ -505,11 +591,24 @@ def handle_vest_message(client, data):
 
         print(f"\n[조끼 수신: {mcu_id}] BodyT: {body_temp}, HR: {hr}, Fell: {is_fell}")
 
+        # 1. 낙상 감지 처리 (즉시 저장 필요)
         if is_fell == 1:
-            print(f" >> [긴급] 낙상 감지! 경보 전송.")
+            print(f" >> [긴급] 낙상 감지! 경보 전송 및 DB 저장.")
             client.publish(f"vest/alert/{mcu_id}", "ALERT")
+            # 낙상 시 위치 정보가 없으면 Unknown으로라도 저장
+            save_worker_status_to_db(
+                mcu_id,
+                "Unknown",
+                0,
+                0,
+                body_temp,
+                hr,
+                is_fell,
+                "낙상 사고 (FALL DETECTED)",
+            )
             return
 
+        # 2. 위치 및 환경 파악
         if not scanned_beacons:
             print(" >> 비콘 없음. 위치 확인 불가.")
             return
@@ -537,23 +636,29 @@ def handle_vest_message(client, data):
         if body_temp is None or hr is None:
             return
 
+        # 3. 위험 예측
         input_data = [[body_temp, hr, env_temp, env_humi]]
-
         result = predict_hybrid(input_data, scaler, model)
         final_status = result[0]
 
         print(f" >> 분석 결과: {final_status}")
 
+        # 4. MQTT 알림 전송
         alert_topic = f"vest/alert/{mcu_id}"
-
         if final_status == "NORMAL":
             client.publish(alert_topic, "NORMAL")
             print(" >> 조치: NORMAL 전송")
         elif final_status == "DATA_ERROR":
             print(" >> 조치: 데이터 오류로 스킵")
+            return  # 데이터 에러면 DB 저장도 하지 않음
         else:
             client.publish(alert_topic, "ALERT")
             print(f" >> 조치: 경보 전송 (ALERT) - 사유: {final_status}")
+
+        # 5. DB 저장 (Upsert 호출)
+        save_worker_status_to_db(
+            mcu_id, env_name, env_temp, env_humi, body_temp, hr, is_fell, final_status
+        )
 
     except Exception as e:
         print(f"[조끼 처리 오류] {e}")
@@ -562,6 +667,9 @@ def handle_vest_message(client, data):
 # =============================================================================
 # 파트 5: MQTT 연결 및 실행
 # =============================================================================
+
+# DB 테이블 초기화 실행
+init_db()
 
 MQTT_BROKER_HOST = "broker.hivemq.com"
 MQTT_BROKER_PORT = 1883

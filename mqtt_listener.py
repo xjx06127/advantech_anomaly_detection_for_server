@@ -1,4 +1,4 @@
-# mqtt_listener.py (최종: 2D AI 필터 + 4D 휴리스틱 진단)
+# mqtt_listener.py (최종: 15초 위치 고정 + 2D/4D 진단 + 로그 저장)
 
 import paho.mqtt.client as mqtt
 import json
@@ -12,29 +12,38 @@ import mysql.connector
 from mysql.connector import Error
 
 # =============================================================================
-# [설정] AWS MySQL 데이터베이스 정보 입력
+# [설정] AWS MySQL 데이터베이스 정보
 # =============================================================================
 DB_CONFIG = {
-    "host": "3.106.191.215",  # AWS EC2의 퍼블릭 IP 또는 도메인
-    "user": "xjx06127",  # 위에서 생성한 유저 이름
-    "password": "pwd",  # 설정한 비밀번호
-    "database": "safety_db",  # 데이터베이스 이름
+    "host": "3.106.191.215",
+    "user": "xjx06127",
+    "password": "pwd",
+    "database": "safety_db",
     "port": 3306,
 }
 
+# =============================================================================
+# [설정] 위치 고정(Lock) 설정
+# =============================================================================
+# 작업자별 위치 잠금 상태 저장 { "mcu_id": {"name": "환경1", "temp": 25.0, "humi": 60.0, "expiry": 12345678} }
+location_locks = {}
+LOCK_DURATION = 15.0  # 한번 위치 잡히면 15초 동안은 절대 안 바뀜
+
 
 # =============================================================================
-# [DB 함수] 테이블 생성 및 데이터 저장 (Upsert)
+# [DB 함수] 테이블 생성 및 데이터 저장
 # =============================================================================
 def init_db():
-    """프로그램 시작 시 테이블이 없으면 생성"""
+    """프로그램 시작 시 테이블 초기화"""
     conn = None
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
         if conn.is_connected():
             cursor = conn.cursor()
-            # mcu_id를 PRIMARY KEY로 설정하여 중복 방지
-            create_table_query = """
+
+            # 1. 현재 상태 저장용 (덮어쓰기)
+            cursor.execute(
+                """
             CREATE TABLE IF NOT EXISTS worker_status (
                 mcu_id VARCHAR(50) PRIMARY KEY,
                 env_location VARCHAR(50),
@@ -47,9 +56,27 @@ def init_db():
                 last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
             )
             """
-            cursor.execute(create_table_query)
+            )
+
+            # 2. 이력 저장용 (계속 쌓기, 온습도 포함)
+            cursor.execute(
+                """
+            CREATE TABLE IF NOT EXISTS vest_log (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                mcu_id VARCHAR(50),
+                env_location VARCHAR(50),
+                env_temp FLOAT,
+                env_humidity FLOAT,
+                body_temp FLOAT,
+                heart_rate INT,
+                is_fell BOOLEAN,
+                analysis_result VARCHAR(100),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+            )
             conn.commit()
-            print(">> [DB] 테이블 초기화 완료 (worker_status)")
+            print(">> [DB] 테이블 초기화 완료 (worker_status, vest_log)")
     except Error as e:
         print(f"[DB 초기화 오류] {e}")
     finally:
@@ -58,18 +85,12 @@ def init_db():
 
 
 def save_worker_status_to_db(mcu_id, location, et, eh, bt, hr, fell, result):
-    """
-    MySQL에 작업자 상태 저장 (Upsert)
-    - 이미 존재하는 mcu_id면 정보를 UPDATE
-    - 없는 mcu_id면 정보를 INSERT
-    """
+    """[현재 상태] worker_status 테이블에 Upsert"""
     conn = None
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
         if conn.is_connected():
             cursor = conn.cursor()
-
-            # INSERT ... ON DUPLICATE KEY UPDATE 구문 사용
             sql = """
             INSERT INTO worker_status 
             (mcu_id, env_location, env_temp, env_humidity, body_temp, heart_rate, is_fell, analysis_result)
@@ -85,28 +106,46 @@ def save_worker_status_to_db(mcu_id, location, et, eh, bt, hr, fell, result):
                 last_updated = CURRENT_TIMESTAMP
             """
             val = (mcu_id, location, et, eh, bt, hr, fell, result)
-
             cursor.execute(sql, val)
             conn.commit()
-            print(f" >> [DB 저장] {mcu_id} 데이터 갱신 완료")  # 너무 빈번하면 주석 처리
-
     except Error as e:
-        print(f"[DB 저장 오류] {e}")
+        print(f"[DB 상태 저장 오류] {e}")
     finally:
         if conn and conn.is_connected():
             cursor.close()
             conn.close()
 
 
-print("--- [서버 시작] 하이브리드 위험 예측 시스템 ---")
+def save_vest_log_to_db(mcu_id, location, et, eh, bt, hr, fell, result):
+    """[과거 이력] vest_log 테이블에 Insert (온습도 포함)"""
+    conn = None
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        if conn.is_connected():
+            cursor = conn.cursor()
+            sql = """
+            INSERT INTO vest_log 
+            (mcu_id, env_location, env_temp, env_humidity, body_temp, heart_rate, is_fell, analysis_result)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            val = (mcu_id, location, et, eh, bt, hr, fell, result)
+            cursor.execute(sql, val)
+            conn.commit()
+    except Error as e:
+        print(f"[DB 로그 저장 오류] {e}")
+    finally:
+        if conn and conn.is_connected():
+            cursor.close()
+            conn.close()
+
+
+print("--- [서버 시작] 하이브리드 위험 예측 시스템 (위치 고정 Ver) ---")
 print(">> 모델과 스케일러를 로드합니다...")
 
 
 # =============================================================================
 # 파트 1: 휴리스틱 진단 로직 (2차 필터)
 # =============================================================================
-
-# 체감온도 계산용 테이블 (기존 유지)
 WIND_CHILL_DATA = {
     25: {
         25: 22.2,
@@ -400,61 +439,41 @@ WIND_CHILL_DATA = {
 
 
 def get_wind_chill(env_temp, env_humidity):
-    """표에서 체감온도 조회 (Safe Lookup)"""
     rounded_temp = int(round(env_temp))
     if rounded_temp < 25 or rounded_temp > 40:
         return None
-
     temp_data = WIND_CHILL_DATA.get(rounded_temp)
     if temp_data is None:
         return None
-
     rounded_humidity = int(round(env_humidity / 5.0) * 5)
     if rounded_humidity < 25:
         return None
     if rounded_humidity > 100:
         rounded_humidity = 100
-
     return temp_data.get(rounded_humidity)
 
 
 def get_effective_env_temp(env_temp, env_humidity):
-    """환경 온/습도를 고려한 체감 온도 계산 (고온일 때 습도 반영)"""
     if env_temp >= 25.0:
         wind_chill = get_wind_chill(env_temp, env_humidity)
-        if wind_chill is not None:
-            return wind_chill
-        else:
-            return env_temp
+        return wind_chill if wind_chill is not None else env_temp
     else:
         return env_temp
 
 
 def analyze_risk_heuristics(row):
-    b_temp = row["body_temp"]  # 손목 체온
-    hr = row["heart_rate"]  # 심박수
-    e_temp = row["env_temp"]  # 환경 온도
-    e_humi = row["env_humidity"]  # 환경 습도
-
-    # 체감 온도 계산 (열사병 판단 시 습도 반영)
+    b_temp = row["body_temp"]
+    hr = row["heart_rate"]
+    e_temp = row["env_temp"]
+    e_humi = row["env_humidity"]
     effective_env_temp = get_effective_env_temp(e_temp, e_humi)
-
-    # 1. 저온 환경 위험 체크 (저체온증)
-    # 규칙: 환경 온도가 4도 이하이고, 체온이 동적 임계값 이하일 때
-    # 33도 이하부터 저체온 의심(심부 35도 이상)
-
     min_safe_wrist_temp = (0.09073 * e_temp) + 33.0
     LOW_ENV_TEMP_THRESHOLD = 4.0
 
     if e_temp <= LOW_ENV_TEMP_THRESHOLD and b_temp <= min_safe_wrist_temp:
         return f"저체온증 위험 (환경 {e_temp:.1f}°C, 체온 {b_temp:.1f}°C)"
 
-    # 2. 고온 환경 위험 체크 (열사병)
-    # 규칙: '체감 온도(습도포함)'가 31도 이상이고, 체온이 동적 임계값 이상일 때
-    # 35도 이상부터 온열질환 의심(심부 37도 이상)
-
     max_safe_wrist_temp = (0.09073 * effective_env_temp) + 35.0
-
     HIGH_EFFECTIVE_ENV_THRESHOLD = 31.0
 
     if (
@@ -463,40 +482,29 @@ def analyze_risk_heuristics(row):
     ):
         return f"열사병 위험 (체감 {effective_env_temp:.1f}°C, 체온 {b_temp:.1f}°C)"
 
-    # 심박수 이상 or 고온 저온 아닌 일반 환경에서 저체온 고체온 탐지
-    # min, max 값 안쓰는 이유는 threshold 없이 단독으로 쓰면 24도 환경에서 34도인 값도 저체온으로 판명되는 이상 경우 생김.
-    # threshold를 잡아주기 애매함. 그래서 그냥 33, 35로 기준치 잡는게 나을 듯?
-    # 근데 다시 생각은 해보자.. 어떻게 min, max 값 못쓰나?
     if b_temp <= 33 and hr < 50:
         return f"저체온 및 서맥 (환경 {e_temp:.1f}°C, 체온 {b_temp:.1f}°C)"
-
     elif b_temp >= 35 and hr > 100:
         return f"고체온 및 빈맥 (체감 {effective_env_temp:.1f}°C, 체온 {b_temp:.1f}°C)"
 
     if b_temp <= 33:
         return f"저체온 (환경 {e_temp:.1f}°C, 체온 {b_temp:.1f}°C)"
-
     elif b_temp >= 35:
         return f"고체온 (체감 {effective_env_temp:.1f}°C, 체온 {b_temp:.1f}°C)"
 
-    # 3. 심박수 극한 이상 체크 (환경 무관)
     if hr > 100:
         return f"빈맥 위험 (고심박 {hr} bpm)"
     elif hr < 50:
         return f"서맥 위험 (저심박 {hr} bpm)"
 
-    # 4. 결론: AI는 이상치라고 했지만, 위 위험 규칙에 안 걸림 -> '안전'
-    return "SAFE_ADAPTATION"  # 안전한 환경 적응으로 판단
+    return "SAFE_ADAPTATION"
 
 
 # =============================================================================
-# 파트 2: 하이브리드 예측 함수 (핵심 로직)
+# 파트 2: 하이브리드 예측 함수
 # =============================================================================
-
-
 def predict_hybrid(data_list, fitted_scaler, fitted_model):
     results = []
-
     df_full = pd.DataFrame(
         data_list, columns=["body_temp", "heart_rate", "env_temp", "env_humidity"]
     )
@@ -516,25 +524,22 @@ def predict_hybrid(data_list, fitted_scaler, fitted_model):
         else:
             row = df_full.iloc[i]
             risk_diagnosis = analyze_risk_heuristics(row)
-
             if risk_diagnosis == "SAFE_ADAPTATION":
                 results.append("NORMAL")
             else:
                 results.append(risk_diagnosis)
-
     return results
 
 
 # =============================================================================
 # 파트 3: 저장된 모델 로드
 # =============================================================================
-
 try:
     scaler = joblib.load("scaler.joblib")
     model = joblib.load("model.joblib")
     print(">> scaler.joblib, model.joblib 로드 성공.")
 except FileNotFoundError:
-    print("[치명적 오류] 모델 파일이 없습니다. 'train_model.py'를 먼저 실행하세요.")
+    print("[치명적 오류] 모델 파일이 없습니다.")
     exit()
 
 
@@ -542,11 +547,10 @@ except FileNotFoundError:
 # 파트 4: 서버 상태 및 MQTT 핸들러
 # =============================================================================
 BEACON_TO_ENV_MAP = {
-    "40011-55612": "환경 1 (고온)",
-    "9999-1": "환경 2 (저온)",
-    "9999-2": "환경 3 (일반)",
+    "40011-55612": "환경 1",
+    "40011-55583": "환경 2",
+    "40011-55581": "환경 3",
 }
-
 environment_state = {}
 ENV_DATA_TIMEOUT = 300.0
 
@@ -557,7 +561,6 @@ def handle_env_message(data):
         minor = data.get("beacon_minor")
         if major is None or minor is None:
             return
-
         beacon_key = f"{major}-{minor}"
         env_name = BEACON_TO_ENV_MAP.get(beacon_key)
         if env_name is None:
@@ -588,19 +591,87 @@ def handle_vest_message(client, data):
 
         if mcu_id is None:
             return
+        if body_temp is None or hr is None:
+            return
 
-        print(f"\n[조끼 수신: {mcu_id}] BodyT: {body_temp}, HR: {hr}, Fell: {is_fell}")
+        print(f"\n[조끼 수신: {mcu_id}] T:{body_temp}, HR:{hr}, Fell:{is_fell}")
 
-        # 1. 낙상 감지 처리 (즉시 저장 필요)
+        # ---------------------------------------------------------
+        # [Step 1] 위치 결정 로직 (15초 강제 고정)
+        # ---------------------------------------------------------
+        current_time = time.time()
+        lock_info = location_locks.get(mcu_id)
+
+        final_env_name = "Unknown"
+        final_env_temp = 0.0
+        final_env_humi = 0.0
+
+        # 1-1. 잠금(Lock)이 걸려있고 유효한지 확인
+        if lock_info and current_time < lock_info["expiry"]:
+            # [잠금 상태] 비콘 스캔 무시하고 저장된 위치 사용
+            final_env_name = lock_info["name"]
+            final_env_temp = lock_info["temp"]
+            final_env_humi = lock_info["humi"]
+            remaining_time = int(lock_info["expiry"] - current_time)
+            # print(f" >> [위치 고정 중] {final_env_name} (남은 시간: {remaining_time}초)")
+
+        else:
+            # 1-2. 잠금 없음 또는 만료됨 -> 새로운 비콘 스캔 시도
+            found_new_location = False
+
+            if scanned_beacons:
+                strongest_beacon = max(scanned_beacons, key=lambda b: b["rssi"])
+                beacon_key = (
+                    f"{strongest_beacon.get('major')}-{strongest_beacon.get('minor')}"
+                )
+                found_name = BEACON_TO_ENV_MAP.get(beacon_key)
+
+                if found_name:
+                    env_data = environment_state.get(found_name)
+                    # 환경 데이터 유효성 체크
+                    if env_data and (
+                        time.time() - env_data["last_updated"] <= ENV_DATA_TIMEOUT
+                    ):
+                        # [새 위치 발견] -> 15초간 잠금(Lock) 설정
+                        final_env_name = found_name
+                        final_env_temp = env_data["env_temp"]
+                        final_env_humi = env_data["env_humi"]
+
+                        location_locks[mcu_id] = {
+                            "name": final_env_name,
+                            "temp": final_env_temp,
+                            "humi": final_env_humi,
+                            "expiry": current_time + LOCK_DURATION,
+                        }
+                        found_new_location = True
+                        print(f" >> [새 위치 고정] {final_env_name} (15초간 유지)")
+
+            if not found_new_location:
+                print(" >> [위치 미확인] 잠금 만료되었으나 신호 없음. (Unknown)")
+
+        # ---------------------------------------------------------
+        # [Step 2] 낙상 감지 처리 (긴급 우선)
+        # ---------------------------------------------------------
         if is_fell == 1:
-            print(f" >> [긴급] 낙상 감지! 경보 전송 및 DB 저장.")
+            print(f" >> [긴급] 낙상 감지! 저장 위치: {final_env_name}")
             client.publish(f"vest/alert/{mcu_id}", "ALERT")
-            # 낙상 시 위치 정보가 없으면 Unknown으로라도 저장
+
+            # 고정된 위치 정보로 저장
             save_worker_status_to_db(
                 mcu_id,
-                "Unknown",
-                0,
-                0,
+                final_env_name,
+                final_env_temp,
+                final_env_humi,
+                body_temp,
+                hr,
+                is_fell,
+                "낙상 사고 (FALL DETECTED)",
+            )
+            save_vest_log_to_db(
+                mcu_id,
+                final_env_name,
+                final_env_temp,
+                final_env_humi,
                 body_temp,
                 hr,
                 is_fell,
@@ -608,56 +679,47 @@ def handle_vest_message(client, data):
             )
             return
 
-        # 2. 위치 및 환경 파악
-        if not scanned_beacons:
-            print(" >> 비콘 없음. 위치 확인 불가.")
+        # ---------------------------------------------------------
+        # [Step 3] AI 위험 예측
+        # ---------------------------------------------------------
+        if final_env_name == "Unknown":
+            print(" >> 위치 데이터 부족으로 AI 분석 스킵")
             return
 
-        strongest_beacon = max(scanned_beacons, key=lambda b: b["rssi"])
-        beacon_key = f"{strongest_beacon.get('major')}-{strongest_beacon.get('minor')}"
-        env_name = BEACON_TO_ENV_MAP.get(beacon_key)
-
-        if env_name is None:
-            print(f" >> 알 수 없는 위치 ({beacon_key})")
-            return
-
-        env_data = environment_state.get(env_name)
-        if env_data is None:
-            print(f" >> {env_name}의 환경 데이터가 서버에 없음.")
-            return
-
-        if time.time() - env_data["last_updated"] > ENV_DATA_TIMEOUT:
-            print(f" >> {env_name} 환경 데이터 만료됨.")
-            return
-
-        env_temp = env_data["env_temp"]
-        env_humi = env_data["env_humi"]
-
-        if body_temp is None or hr is None:
-            return
-
-        # 3. 위험 예측
-        input_data = [[body_temp, hr, env_temp, env_humi]]
+        input_data = [[body_temp, hr, final_env_temp, final_env_humi]]
         result = predict_hybrid(input_data, scaler, model)
         final_status = result[0]
-
         print(f" >> 분석 결과: {final_status}")
 
-        # 4. MQTT 알림 전송
+        # ---------------------------------------------------------
+        # [Step 4] 결과 전송 및 저장
+        # ---------------------------------------------------------
         alert_topic = f"vest/alert/{mcu_id}"
-        if final_status == "NORMAL":
-            client.publish(alert_topic, "NORMAL")
-            print(" >> 조치: NORMAL 전송")
-        elif final_status == "DATA_ERROR":
-            print(" >> 조치: 데이터 오류로 스킵")
-            return  # 데이터 에러면 DB 저장도 하지 않음
-        else:
+        if final_status != "NORMAL" and final_status != "DATA_ERROR":
             client.publish(alert_topic, "ALERT")
-            print(f" >> 조치: 경보 전송 (ALERT) - 사유: {final_status}")
+            print(f" >> 조치: 경보 전송 (ALERT)")
+        else:
+            client.publish(alert_topic, "NORMAL")
 
-        # 5. DB 저장 (Upsert 호출)
         save_worker_status_to_db(
-            mcu_id, env_name, env_temp, env_humi, body_temp, hr, is_fell, final_status
+            mcu_id,
+            final_env_name,
+            final_env_temp,
+            final_env_humi,
+            body_temp,
+            hr,
+            is_fell,
+            final_status,
+        )
+        save_vest_log_to_db(
+            mcu_id,
+            final_env_name,
+            final_env_temp,
+            final_env_humi,
+            body_temp,
+            hr,
+            is_fell,
+            final_status,
         )
 
     except Exception as e:
@@ -667,8 +729,6 @@ def handle_vest_message(client, data):
 # =============================================================================
 # 파트 5: MQTT 연결 및 실행
 # =============================================================================
-
-# DB 테이블 초기화 실행
 init_db()
 
 MQTT_BROKER_HOST = "broker.hivemq.com"

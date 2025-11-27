@@ -22,6 +22,8 @@ DB_CONFIG = {
     "port": 3306,
 }
 
+GLOBAL_DB_CONNECTION = None
+
 # =============================================================================
 # [설정] 위치 고정(Lock) 설정
 # =============================================================================
@@ -29,12 +31,19 @@ DB_CONFIG = {
 location_locks = {}
 LOCK_DURATION = 15.0  # 한번 위치 잡히면 15초 동안은 절대 안 바뀜
 
+WORKER_NAME_MAP = {
+    "D0:CF:13:09:C2:94": "작업자 1",  # 실제 MAC 주소로 변경
+    "FC:01:2C:C3:BB:8C": "작업자 2",
+    "0": "작업자 3",
+}
+
 
 # =============================================================================
 # [DB 함수] 테이블 생성 및 데이터 저장
 # =============================================================================
 def init_db():
     """프로그램 시작 시 테이블 초기화"""
+    global GLOBAL_DB_CONNECTION  # 전역 변수 사용 선언
     conn = None
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
@@ -83,12 +92,18 @@ def init_db():
         if conn and conn.is_connected():
             conn.close()
 
-
-def save_worker_status_to_db(mcu_id, location, et, eh, bt, hr, fell, result):
-    """[현재 상태] worker_status 테이블에 Upsert"""
-    conn = None
+    # 2. 전역 연결을 생성하고 유지
     try:
-        conn = mysql.connector.connect(**DB_CONFIG)
+        GLOBAL_DB_CONNECTION = mysql.connector.connect(**DB_CONFIG)
+        print(">> [DB] 영구 연결 생성 성공.")
+    except Error as e:
+        print(f"[DB 치명적 오류] 영구 연결 실패: {e}")
+        exit()  # 연결 없이는 프로그램 종료
+
+
+def save_worker_status_to_db(conn, mcu_id, location, et, eh, bt, hr, fell, result):
+    """[현재 상태] worker_status 테이블에 Upsert"""
+    try:
         if conn.is_connected():
             cursor = conn.cursor()
             sql = """
@@ -111,16 +126,13 @@ def save_worker_status_to_db(mcu_id, location, et, eh, bt, hr, fell, result):
     except Error as e:
         print(f"[DB 상태 저장 오류] {e}")
     finally:
-        if conn and conn.is_connected():
+        if "cursor" in locals() and cursor:  # cursor가 정의되고 존재할 때만 닫기
             cursor.close()
-            conn.close()
 
 
-def save_vest_log_to_db(mcu_id, location, et, eh, bt, hr, fell, result):
+def save_vest_log_to_db(conn, mcu_id, location, et, eh, bt, hr, fell, result):
     """[과거 이력] vest_log 테이블에 Insert (온습도 포함)"""
-    conn = None
     try:
-        conn = mysql.connector.connect(**DB_CONFIG)
         if conn.is_connected():
             cursor = conn.cursor()
             sql = """
@@ -134,9 +146,8 @@ def save_vest_log_to_db(mcu_id, location, et, eh, bt, hr, fell, result):
     except Error as e:
         print(f"[DB 로그 저장 오류] {e}")
     finally:
-        if conn and conn.is_connected():
+        if "cursor" in locals() and cursor:
             cursor.close()
-            conn.close()
 
 
 print("--- [서버 시작] 하이브리드 위험 예측 시스템 (위치 고정 Ver) ---")
@@ -471,7 +482,7 @@ def analyze_risk_heuristics(row):
     LOW_ENV_TEMP_THRESHOLD = 4.0
 
     if e_temp <= LOW_ENV_TEMP_THRESHOLD and b_temp <= min_safe_wrist_temp:
-        return f"저체온증 위험 (환경 {e_temp:.1f}°C, 체온 {b_temp:.1f}°C)"
+        return f"저체온증 위험"
 
     max_safe_wrist_temp = (0.09073 * effective_env_temp) + 35.0
     HIGH_EFFECTIVE_ENV_THRESHOLD = 31.0
@@ -480,22 +491,22 @@ def analyze_risk_heuristics(row):
         effective_env_temp >= HIGH_EFFECTIVE_ENV_THRESHOLD
         and b_temp >= max_safe_wrist_temp
     ):
-        return f"열사병 위험 (체감 {effective_env_temp:.1f}°C, 체온 {b_temp:.1f}°C)"
+        return f"일사병 위험"
 
     if b_temp <= 33 and hr < 50:
-        return f"저체온 및 서맥 (환경 {e_temp:.1f}°C, 체온 {b_temp:.1f}°C)"
+        return f"저체온 및 서맥 위험"
     elif b_temp >= 35 and hr > 100:
-        return f"고체온 및 빈맥 (체감 {effective_env_temp:.1f}°C, 체온 {b_temp:.1f}°C)"
+        return f"고체온 및 빈맥 위험"
 
     if b_temp <= 33:
-        return f"저체온 (환경 {e_temp:.1f}°C, 체온 {b_temp:.1f}°C)"
+        return f"저체온"
     elif b_temp >= 35:
-        return f"고체온 (체감 {effective_env_temp:.1f}°C, 체온 {b_temp:.1f}°C)"
+        return f"고체온"
 
     if hr > 100:
-        return f"빈맥 위험 (고심박 {hr} bpm)"
+        return f"빈맥 위험"
     elif hr < 50:
-        return f"서맥 위험 (저심박 {hr} bpm)"
+        return f"서맥 위험"
 
     return "SAFE_ADAPTATION"
 
@@ -520,12 +531,12 @@ def predict_hybrid(data_list, fitted_scaler, fitted_model):
 
     for i in range(len(df_full)):
         if anomaly_predictions[i] == 1:
-            results.append("NORMAL")
+            results.append("정상")
         else:
             row = df_full.iloc[i]
             risk_diagnosis = analyze_risk_heuristics(row)
             if risk_diagnosis == "SAFE_ADAPTATION":
-                results.append("NORMAL")
+                results.append("정상")
             else:
                 results.append(risk_diagnosis)
     return results
@@ -548,8 +559,8 @@ except FileNotFoundError:
 # =============================================================================
 BEACON_TO_ENV_MAP = {
     "40011-55612": "환경 1",
-    "40011-55583": "환경 2",
-    "40011-55581": "환경 3",
+    "40011-55581": "환경 2",
+    "40011-55583": "환경 3",
 }
 environment_state = {}
 ENV_DATA_TIMEOUT = 300.0
@@ -582,19 +593,22 @@ def handle_env_message(data):
 
 
 def handle_vest_message(client, data):
+    global GLOBAL_DB_CONNECTION  # 전역 변수 사용 선언
     try:
+        # start_time = time.time()
         mcu_id = data.get("mcu_id")
         body_temp = data.get("body_temp")
         hr = data.get("hr")
         is_fell = data.get("is_fell")
         scanned_beacons = data.get("beacons", [])
+        db_save_name = WORKER_NAME_MAP.get(mcu_id)
 
         if mcu_id is None:
             return
         if body_temp is None or hr is None:
             return
 
-        print(f"\n[조끼 수신: {mcu_id}] T:{body_temp}, HR:{hr}, Fell:{is_fell}")
+        print(f"\n[조끼 수신: {db_save_name}] T:{body_temp}, HR:{hr}, Fell:{is_fell}")
 
         # ---------------------------------------------------------
         # [Step 1] 위치 결정 로직 (15초 강제 고정)
@@ -644,44 +658,49 @@ def handle_vest_message(client, data):
                             "expiry": current_time + LOCK_DURATION,
                         }
                         found_new_location = True
-                        print(f" >> [새 위치 고정] {final_env_name} (15초간 유지)")
+                        print(
+                            f" >> [새 위치 고정] {final_env_name} (15초간 유지)"
+                        )  # 비콘 값 손실을 막기 위함
 
             if not found_new_location:
                 print(" >> [위치 미확인] 잠금 만료되었으나 신호 없음. (Unknown)")
-
+        # print(f"위치 결정 소요 시간: {time.time() - start_time:.4f}s")  # 확인 1
         # ---------------------------------------------------------
         # [Step 2] 낙상 감지 처리 (긴급 우선)
         # ---------------------------------------------------------
         if is_fell == 1:
             print(f" >> [긴급] 낙상 감지! 저장 위치: {final_env_name}")
-            client.publish(f"vest/alert/{mcu_id}", "ALERT")
+            client.publish(f"vest/alert/{mcu_id}", "경보")
 
             # 고정된 위치 정보로 저장
             save_worker_status_to_db(
-                mcu_id,
+                GLOBAL_DB_CONNECTION,
+                db_save_name,
                 final_env_name,
                 final_env_temp,
                 final_env_humi,
                 body_temp,
                 hr,
                 is_fell,
-                "낙상 사고 (FALL DETECTED)",
+                "낙상 사고",
             )
             save_vest_log_to_db(
-                mcu_id,
+                GLOBAL_DB_CONNECTION,
+                db_save_name,
                 final_env_name,
                 final_env_temp,
                 final_env_humi,
                 body_temp,
                 hr,
                 is_fell,
-                "낙상 사고 (FALL DETECTED)",
+                "낙상 사고",
             )
             return
 
         # ---------------------------------------------------------
         # [Step 3] AI 위험 예측
         # ---------------------------------------------------------
+        # ai_start = time.time()
         if final_env_name == "Unknown":
             print(" >> 위치 데이터 부족으로 AI 분석 스킵")
             return
@@ -690,19 +709,22 @@ def handle_vest_message(client, data):
         result = predict_hybrid(input_data, scaler, model)
         final_status = result[0]
         print(f" >> 분석 결과: {final_status}")
-
+        # print(f"AI 분석 소요 시간: {time.time() - ai_start:.4f}s")  # 확인 2
         # ---------------------------------------------------------
         # [Step 4] 결과 전송 및 저장
         # ---------------------------------------------------------
         alert_topic = f"vest/alert/{mcu_id}"
-        if final_status != "NORMAL" and final_status != "DATA_ERROR":
+        if final_status != "정상" and final_status != "DATA_ERROR":
             client.publish(alert_topic, "ALERT")
-            print(f" >> 조치: 경보 전송 (ALERT)")
+            print(f" >> 조치: 경보 전송 ")
         else:
             client.publish(alert_topic, "NORMAL")
 
+        # db_start = time.time()
+
         save_worker_status_to_db(
-            mcu_id,
+            GLOBAL_DB_CONNECTION,
+            db_save_name,
             final_env_name,
             final_env_temp,
             final_env_humi,
@@ -712,7 +734,8 @@ def handle_vest_message(client, data):
             final_status,
         )
         save_vest_log_to_db(
-            mcu_id,
+            GLOBAL_DB_CONNECTION,
+            db_save_name,
             final_env_name,
             final_env_temp,
             final_env_humi,
@@ -721,7 +744,7 @@ def handle_vest_message(client, data):
             is_fell,
             final_status,
         )
-
+        # print(f"DB 저장 소요 시간: {time.time() - db_start:.4f}s")  # 확인 3
     except Exception as e:
         print(f"[조끼 처리 오류] {e}")
 

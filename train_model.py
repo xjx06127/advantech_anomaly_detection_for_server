@@ -15,7 +15,7 @@ print("--- [훈련 시작] 2D AI 모델 (BodyTemp, HeartRate) ---")
 
 # 1. 데이터 로드
 try:
-    df = pd.read_csv('training_dataset.csv')
+    df = pd.read_csv("training_dataset.csv")
     print(f">> 데이터 로드 성공: {len(df)} 행")
 except FileNotFoundError:
     print("[오류] 'training_dataset.csv' 파일이 없습니다.")
@@ -25,8 +25,8 @@ except FileNotFoundError:
 # mean.WristT_5 -> body_temp
 # mean.hr_5     -> heart_rate
 train_df = pd.DataFrame()
-train_df['body_temp'] = df['mean.WristT_5']
-train_df['heart_rate'] = df['mean.hr_5']
+train_df["body_temp"] = df["mean.WristT_5"]
+train_df["heart_rate"] = df["mean.hr_5"]
 
 # 3. 결측치 제거
 original_len = len(train_df)
@@ -44,14 +44,13 @@ X_train = scaler.fit_transform(train_df)
 print(">> 데이터 스케일링 완료")
 
 # 5. Isolation Forest 모델 학습
-# contamination=0.01: 학습 데이터의 1% 정도는 노이즈(이상치)라고 가정
 print(">> 모델 학습 중 (Isolation Forest)...")
 model = IsolationForest(n_estimators=200, contamination="auto", random_state=42)
 model.fit(X_train)
 
 # 6. 모델 및 스케일러 저장
-joblib.dump(scaler, 'scaler.joblib')
-joblib.dump(model, 'model.joblib')
+joblib.dump(scaler, "scaler.joblib")
+joblib.dump(model, "model.joblib")
 
 print("\n[훈련 완료]")
 print(">> 'scaler.joblib' 저장됨")
